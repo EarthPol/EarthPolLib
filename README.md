@@ -18,15 +18,25 @@ Use `mvn -B package` when you want the release jars under `target/`.
 
 EarthPolLib is a library jar. It should be shaded into the plugin that uses it.
 
-For local development, run `mvn -B install` in this project, then add the dependency to your plugin:
+Add the Bitworks Nexus repository and the dependency to your plugin. Use the version from
+the [latest release](https://github.com/EarthPol/EarthPolLib/releases/latest):
 
 ```xml
+<repositories>
+    <repository>
+        <id>bitworks-releases</id>
+        <url>https://nexus.tinydc.net/repository/maven-releases/</url>
+    </repository>
+</repositories>
+
 <dependency>
     <groupId>com.earthpol</groupId>
     <artifactId>earthpollib</artifactId>
     <version>1.0.0</version>
 </dependency>
 ```
+
+For local development, run `mvn -B install` in this project to install the version in `pom.xml`.
 
 Notes:
 
@@ -57,9 +67,29 @@ JDBC parameter customization is additive through `DatabaseManager` and preserves
 
 ## Release Model
 
-- Pushes and pull requests to `main` run CI only.
-- GitHub releases are created from version tags such as `v1.0.0`.
-- Tagged releases publish `com.earthpol:earthpollib` to GitHub Packages for `EarthPolForever/EarthPolLib`.
-- The release workflow uploads the jars built in `target/`, including the main artifact and attached source or javadoc jars.
+- Work on feature branches and open pull requests into `main`. Branch protection requires the
+  GitHub Actions `build` check, an up-to-date branch, and resolved review conversations, including
+  for administrators. Force pushes and branch deletion are blocked. A second reviewer is optional.
+- Every push to `main` triggers the release workflow. It verifies the code, reserves a version tag,
+  publishes `com.earthpol:earthpollib` to Bitworks Nexus, and creates a GitHub release with the main,
+  source, and javadoc jars, the published POM, and SHA-256 checksums.
+- The first release uses `1.0.0`. Later main updates automatically increment the highest release
+  tag's patch version. Raise the version in `pom.xml` to start a new minor or major release.
+  The POM version is a minimum; CI sets the actual artifact version without committing back to main.
+- Releases run sequentially, with pending runs queued. Tags identify the source commit and reserve
+  its version for retries. A new release must include the previous release commit.
+- Publishing uses the same `NEXUS_USERNAME` and `NEXUS_PASSWORD` secrets as HeadDB. They can be
+  repository secrets or organization secrets shared with `EarthPol/EarthPolLib`. Maven's server ID
+  is `nexus-releases`; the snapshot repository is configured for explicit development deployments.
 
-To release, update the version in `pom.xml`, run `mvn -B verify`, and push a matching `v<version>` tag. The workflow checks that the tag matches the Maven version before publishing.
+To retry, rerun the failed Action or run **Release** manually on `main` with its tag, such as
+`v1.0.0`. If all four artifacts are already on Nexus, the workflow reuses those exact bytes for
+the GitHub release. Partial Nexus uploads or pre-existing versions without a matching reserved tag
+stop publication and require the conflicting Nexus version to be resolved before retrying.
+
+To reproduce an artifact from a tag, check it out, set the corresponding Maven version, then build:
+
+```bash
+mvn -B -ntp org.codehaus.mojo:versions-maven-plugin:2.22.0:set -DnewVersion=1.0.0 -DgenerateBackupPoms=false
+mvn -B -ntp clean verify
+```
