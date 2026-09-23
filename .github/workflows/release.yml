@@ -145,6 +145,7 @@ jobs:
           tag_name: ${{ steps.metadata.outputs.tag }}
           name: EarthPolLib ${{ steps.metadata.outputs.version }}
           generate_release_notes: true
+          make_latest: legacy
           fail_on_unmatched_files: true
           files: |
             target/earthpollib-${{ steps.metadata.outputs.version }}.jar
