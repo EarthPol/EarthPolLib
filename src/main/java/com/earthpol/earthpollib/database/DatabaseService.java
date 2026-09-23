@@ -2,13 +2,17 @@ package com.earthpol.earthpollib.database;
 
 import com.earthpol.earthpollib.database.migration.SchemaMigrator;
 import com.earthpol.earthpollib.logging.EnhancedLogger;
+import com.earthpol.earthpollib.scheduling.PluginScheduler;
+import com.earthpol.earthpollib.scheduling.TaskHandle;
 import org.bukkit.plugin.Plugin;
 import org.jetbrains.annotations.Nullable;
 
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.logging.Level;
 
 /**
@@ -23,12 +27,15 @@ import java.util.logging.Level;
  * </ol>
  */
 @SuppressWarnings("unused")
-public final class DatabaseService {
+public final class DatabaseService implements AutoCloseable {
 
-    private DatabaseManager databaseManager = null;
+    private volatile DatabaseManager databaseManager = null;
     private volatile boolean migrated = false;
     private final boolean disablePluginOnFailure;
-    private final AtomicBoolean migrationScheduledOrRunning = new AtomicBoolean(false);
+    private final Object lifecycle = new Object();
+    private final PluginScheduler scheduler;
+    private CompletableFuture<Integer> migrationResult;
+    private volatile boolean closed;
 
     private final @Nullable EnhancedLogger logger;
     private final Plugin plugin;
@@ -48,6 +55,7 @@ public final class DatabaseService {
             String schemaFilesLocation) {
         this.logger = logger;
         this.plugin = Objects.requireNonNull(plugin, "plugin");
+        this.scheduler = new PluginScheduler(this.plugin);
         this.disablePluginOnFailure = disablePluginOnFailure;
         this.schemaFilesLocation = Objects.requireNonNull(schemaFilesLocation, "schemaFilesLocation");
         this.serviceName = (serviceName == null) ? plugin.getName() + "-Database" : serviceName;
@@ -71,14 +79,18 @@ public final class DatabaseService {
         this.databaseManager = Objects.requireNonNull(databaseManager, "databaseManager");
         this.logger = databaseManager.getLogger();
         this.plugin = databaseManager.getOwningPlugin();
+        this.scheduler = new PluginScheduler(this.plugin);
         this.serviceName = (serviceName == null) ? plugin.getName() + "-Database" : serviceName;
         this.disablePluginOnFailure = disablePluginOnFailure;
         this.schemaFilesLocation = Objects.requireNonNull(schemaFilesLocation, "schemaFilesLocation");
     }
 
     public void start() {
+        ensureOpen();
         try {
-            getDB().start();
+            synchronized (lifecycle) {
+                getDB().start();
+            }
         }
 
         catch (Exception e) {
@@ -95,44 +107,135 @@ public final class DatabaseService {
     }
 
     public void migrateAsync() {
-        if (migrated) {
-            logWarn(serviceName + ": migrateAsync() was called, but schema migrations were already completed.");
-            return;
-        }
-        if (!migrationScheduledOrRunning.compareAndSet(false, true)) {
-            logWarn(serviceName + ": migrateAsync() was called, but a migration is already scheduled or running.");
-            return;
-        }
+        migrateAsyncResult();
+    }
 
+    /** Starts the pool and migrates on an async task. Concurrent calls share the same attempt. */
+    public CompletionStage<Integer> initializeAsync() {
+        return scheduleMigration(true);
+    }
+
+    /** Migrates an already started pool; the result is the number of applied migrations. */
+    public CompletionStage<Integer> migrateAsyncResult() {
+        return scheduleMigration(false);
+    }
+
+    private CompletionStage<Integer> scheduleMigration(boolean startDatabase) {
+        CompletableFuture<Integer> result;
+        synchronized (lifecycle) {
+            ensureOpen();
+            if (migrationResult != null && (!migrationResult.isDone() || migrated)) {
+                return migrationResult.minimalCompletionStage();
+            }
+            result = new CompletableFuture<>();
+            migrationResult = result;
+        }
         try {
-            plugin.getServer().getAsyncScheduler().runNow(plugin, task -> {
+            TaskHandle task = scheduler.runAsync(() -> {
                 try {
-                    int applied = SchemaMigrator.migrate(
-                            getDB(),
-                            plugin,
-                            List.of(schemaFilesLocation),
-                            logger
-                    );
-                    logInfo("Schema migration complete. Applied " + applied + " migration(s).");
-                    migrated = true;
-                } catch (Exception ex) {
-                    logSevere("Schema migration FAILED", ex);
-                    if (disablePluginOnFailure) {
-                        logInfo("Shutting down plugin.");
-                        plugin.getServer().getPluginManager().disablePlugin(plugin);
+                    if (startDatabase) {
+                        synchronized (lifecycle) {
+                            getDB().start();
+                        }
                     }
-                } finally {
-                    migrationScheduledOrRunning.set(false);
+                    int applied = SchemaMigrator.migrate(getDB(), plugin, List.of(schemaFilesLocation), logger);
+                    synchronized (lifecycle) {
+                        ensureOpen();
+                        migrated = true;
+                    }
+                    logInfo("Schema migration complete. Applied " + applied + " migration(s).");
+                    result.complete(applied);
+                } catch (Exception ex) {
+                    result.completeExceptionally(ex);
+                    if (!closed) {
+                        logSevere("Schema migration FAILED", ex);
+                        if (disablePluginOnFailure) disableAfterFailure();
+                    }
                 }
             });
-        } catch (RuntimeException ex) {
-            migrationScheduledOrRunning.set(false);
+            task.completion().whenComplete((unused, failure) -> {
+                if (failure != null) result.completeExceptionally(failure);
+            });
+        } catch (RuntimeException | Error ex) {
+            result.completeExceptionally(ex);
             logSevere(serviceName + ": failed to schedule migrateAsync()", ex);
             throw ex;
+        }
+        return result.minimalCompletionStage();
+    }
+
+    /** Waits asynchronously for the requested initialization/migration, then runs SQL off tick threads. */
+    public <T> CompletionStage<T> queryAsync(SqlWork<T> work) {
+        return runWhenReady(work, false);
+    }
+
+    public <T> CompletionStage<T> transactionAsync(SqlWork<T> work) {
+        return runWhenReady(work, true);
+    }
+
+    private <T> CompletionStage<T> runWhenReady(SqlWork<T> work, boolean transaction) {
+        Objects.requireNonNull(work, "work");
+        CompletionStage<Integer> ready;
+        synchronized (lifecycle) {
+            ensureOpen();
+            if (migrationResult == null) throw new IllegalStateException("Call initializeAsync() or migrateAsyncResult() first");
+            ready = migrationResult.minimalCompletionStage();
+        }
+        return ready.thenCompose(applied -> {
+            CompletableFuture<T> result = new CompletableFuture<>();
+            try {
+                TaskHandle task = scheduler.runAsync(() -> {
+                    try {
+                        result.complete(transaction ? getDB().transaction(work) : getDB().withConnection(work));
+                    } catch (Exception ex) {
+                        result.completeExceptionally(ex);
+                    }
+                });
+                task.completion().whenComplete((unused, failure) -> {
+                    if (failure != null) result.completeExceptionally(failure);
+                });
+            } catch (RuntimeException ex) {
+                result.completeExceptionally(ex);
+            }
+            return result.minimalCompletionStage();
+        });
+    }
+
+    /** Cancels queued work and closes the pool. Running SQL may already have taken effect. */
+    @Override
+    public void close() {
+        CompletableFuture<Integer> pending;
+        synchronized (lifecycle) {
+            if (closed) return;
+            closed = true;
+            migrated = false;
+            pending = migrationResult;
+        }
+        if (pending != null) pending.completeExceptionally(new CancellationException("Database service closed"));
+        scheduler.close();
+        DatabaseManager manager = databaseManager;
+        if (manager != null) manager.close();
+    }
+
+    /** A non-blocking readiness check. */
+    public boolean isReady() {
+        return migrated && !closed;
+    }
+
+    private void ensureOpen() {
+        if (closed) throw new IllegalStateException("Database service is closed");
+    }
+
+    private void disableAfterFailure() {
+        try {
+            scheduler.runGlobal(() -> plugin.getServer().getPluginManager().disablePlugin(plugin));
+        } catch (RuntimeException ex) {
+            logSevere("Could not schedule plugin shutdown after database failure", ex);
         }
     }
 
     public DatabaseManager getDB() {
+        ensureOpen();
         if (databaseManager == null)
             throw new IllegalStateException("getDB() failed. databaseManager isn't initialized.");
         return databaseManager;
@@ -156,14 +259,6 @@ public final class DatabaseService {
             logger.info(message);
         } else {
             plugin.getLogger().info(message);
-        }
-    }
-
-    private void logWarn(String message) {
-        if (logger != null) {
-            logger.warn(message);
-        } else {
-            plugin.getLogger().warning(message);
         }
     }
 

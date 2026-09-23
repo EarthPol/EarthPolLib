@@ -1,0 +1,6 @@
+general:
+  prefix: '[EarthPol] '
+legacy: '&aHello {name}'
+mini: '<green>Hello <name>'
+plain: 'Hello {name}'
+button: '<button>'

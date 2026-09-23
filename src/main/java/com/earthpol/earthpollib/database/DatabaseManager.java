@@ -31,7 +31,7 @@ import java.util.function.Consumer;
  * <li>Uses <code>utf8mb4</code> encoding for the connection. Create your tables accordingly. </li>
  */
 @SuppressWarnings("unused")
-public final class DatabaseManager {
+public final class DatabaseManager implements AutoCloseable {
 
     private static final String SESSION_VARIABLES = "character_set_client=utf8mb4,character_set_results=utf8mb4";
 
@@ -246,6 +246,11 @@ public final class DatabaseManager {
         }
     }
 
+    @Override
+    public void close() {
+        shutdown();
+    }
+
     public boolean ping() {
         try (Connection c = getConnection();
              Statement st = c.createStatement();
@@ -261,6 +266,17 @@ public final class DatabaseManager {
 
     public Connection getConnection() throws SQLException {
         return getDataSource().getConnection();
+    }
+
+    public <T> T withConnection(SqlWork<T> work) throws SQLException {
+        Objects.requireNonNull(work, "work");
+        try (Connection connection = getConnection()) {
+            return work.execute(connection);
+        }
+    }
+
+    public <T> T transaction(SqlWork<T> work) throws SQLException {
+        return SqlTransactions.execute(getDataSource(), work);
     }
 
     public DataSource getDataSource() {

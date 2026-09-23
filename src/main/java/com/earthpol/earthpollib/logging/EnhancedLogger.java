@@ -42,7 +42,7 @@ import java.util.logging.Logger;
  * </ul>
  */
 @SuppressWarnings("unused")
-public final class EnhancedLogger {
+public final class EnhancedLogger implements AutoCloseable {
 
     private static final DateTimeFormatter DATE_FN =
             DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneId.systemDefault());
@@ -294,6 +294,7 @@ public final class EnhancedLogger {
         }
     }
 
+    @Override
     public void close() {
         ioLock.lock();
         try {

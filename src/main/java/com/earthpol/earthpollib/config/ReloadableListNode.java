@@ -68,8 +68,16 @@ public class ReloadableListNode<T> extends ReloadableConfigNode<List<T>> {
     @Override
     public void setValue(List<T> value) {
         Objects.requireNonNull(value, "list node data");
-        validateElements(value);
         super.setValue(List.copyOf(value));
+    }
+
+    @Override
+    public void validateValue(List<T> value) {
+        super.validateValue(value);
+        validateElements(value);
+        if (value.stream().anyMatch(Objects::isNull)) {
+            throw new IllegalArgumentException("Null element in '" + getYmlPath() + "'");
+        }
     }
 
     private void validateElements(List<T> value) {

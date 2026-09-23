@@ -1,6 +1,7 @@
 package com.earthpol.earthpollib.config;
 
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.Plugin;
 import org.jetbrains.annotations.NotNull;
@@ -13,6 +14,8 @@ import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.logging.Logger;
@@ -90,10 +93,10 @@ public final class ReloadableConfigHandler<E extends Enum<E> & ReloadableConfigu
 
         this.yaml = YamlConfiguration.loadConfiguration(this.configFile);
         this.yaml.options().parseComments(true);
-        reparseIntoNodes();
+        reparseIntoNodes(false);
     }
 
-    public boolean reload() throws IOException {
+    public synchronized boolean reload() throws IOException {
         YMLBuilder.fillMissingDefaults(
                 this.configFile,
                 map.values(),
@@ -101,15 +104,61 @@ public final class ReloadableConfigHandler<E extends Enum<E> & ReloadableConfigu
         );
         this.yaml = YamlConfiguration.loadConfiguration(this.configFile);
         this.yaml.options().parseComments(true);
-        return reparseIntoNodes();
+        return reparseIntoNodes(true);
+    }
+
+    /**
+     * Stages and validates the whole file before applying any live values. Invalid YAML or values
+     * leave active nodes and yaml() unchanged. Missing keys use defaults without rewriting the file.
+     * Restart-only changes are reported and retained on disk; other validated values are applied.
+     * Use snapshot() for a consistent view across handler reloads; direct node mutations are not coordinated.
+     */
+    public synchronized ConfigReloadResult reloadValidated() throws IOException {
+        YamlConfiguration candidate = new YamlConfiguration();
+        candidate.options().parseComments(true);
+        try {
+            candidate.load(configFile);
+        } catch (InvalidConfigurationException ex) {
+            return new ConfigReloadResult(false, Map.of("<file>", "Invalid YAML: " + ex.getMessage()), Set.of());
+        }
+
+        Map<String, String> errors = new LinkedHashMap<>();
+        Set<String> restart = new HashSet<>();
+        EnumMap<E, Object> staged = new EnumMap<>(enumType);
+        for (E key : keys) {
+            ReloadableConfigNode<?> node = map.get(key);
+            if (node instanceof SectionHeaderNode) continue;
+            try {
+                if (!candidate.contains(node.getYmlPath())) candidate.set(node.getYmlPath(), node.getDefaultValue());
+                Object value = validatedValue(node, readNode(candidate, node));
+                if (node.isRestartRequired() && !Objects.equals(node.getValue(), value)) {
+                    restart.add(node.getYmlPath());
+                } else {
+                    staged.put(key, value);
+                }
+            } catch (RuntimeException ex) {
+                errors.put(node.getYmlPath(), Objects.toString(ex.getMessage(), ex.getClass().getSimpleName()));
+            }
+        }
+        if (!errors.isEmpty()) return new ConfigReloadResult(false, errors, restart);
+        staged.forEach((key, value) -> applyValidated(map.get(key), value));
+        this.yaml = candidate;
+        return new ConfigReloadResult(true, Map.of(), restart);
+    }
+
+    /** A read-only copy of active values, captured consistently against handler reload/set calls. */
+    public synchronized Map<E, Object> snapshot() {
+        EnumMap<E, Object> values = new EnumMap<>(enumType);
+        for (E key : keys) values.put(key, map.get(key).getValue());
+        return Collections.unmodifiableMap(values);
     }
 
     @SuppressWarnings("unchecked")
-    private boolean reparseIntoNodes() {
+    private boolean reparseIntoNodes(boolean reloading) {
         boolean ok = true;
         Logger log = plugin.getLogger();
         for (ReloadableConfigNode<?> n : map.values()) {
-            ok &= loadIntoNode(this.yaml, n, log);
+            ok &= loadIntoNode(this.yaml, n, log, reloading);
         }
         return ok;
     }
@@ -117,7 +166,7 @@ public final class ReloadableConfigHandler<E extends Enum<E> & ReloadableConfigu
     @SuppressWarnings("unchecked")
     private static boolean loadIntoNode(FileConfiguration yaml,
                                         ReloadableConfigNode<?> node,
-                                        Logger log) {
+                                        Logger log, boolean reloading) {
         Objects.requireNonNull(yaml, "yaml");
         Objects.requireNonNull(node, "node");
 
@@ -127,28 +176,48 @@ public final class ReloadableConfigHandler<E extends Enum<E> & ReloadableConfigu
 
         final String path = node.getYmlPath();
         try {
-            if (node instanceof ReloadableListNode<?> listNode) {
-                Class<?> elem = Objects.requireNonNull(listNode.getElementType(), "list elementType");
-                List<?> parsed = YMLLoader.getList(yaml, path, (Class<Object>) elem);
-                ((ReloadableConfigNode<List<?>>) (ReloadableConfigNode<?>) listNode).setValue(parsed);
-            } else {
-                Class<Object> type = (Class<Object>) node.getDataType();
-                Object parsed = YMLLoader.get(yaml, path, type);
-                ((ReloadableConfigNode<Object>) node).setValue(parsed);
+            Object parsed = validatedValue(node, readNode(yaml, node));
+            if (reloading && node.isRestartRequired()) {
+                if (!Objects.equals(node.getValue(), parsed) && log != null) {
+                    log.info("Config key '" + path + "' requires a restart to apply.");
+                }
+                return true;
             }
+            ((ReloadableConfigNode<Object>) node).setValue(parsed);
             return true;
 
         } catch (RuntimeException ex) {
-            ((ReloadableConfigNode<Object>) node).setValue(node.getDefaultValue());
+            boolean retained = reloading && node.isRestartRequired();
+            if (!retained) ((ReloadableConfigNode<Object>) node).setValue(node.getDefaultValue());
             if (log != null) {
                 log.severe("Failed to load '" + path + "' as "
                         + node.getDataType().getSimpleName()
                         + (node instanceof ReloadableListNode<?> ? " list" : "")
-                        + " — using default: " + String.valueOf(node.getDefaultValue())
+                        + (retained ? " — retaining active value" : " — using default: " + String.valueOf(node.getDefaultValue()))
                         + " \nCause: " + ex.getMessage());
             }
             return false;
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object readNode(FileConfiguration yaml, ReloadableConfigNode<?> node) {
+        if (node instanceof ReloadableListNode<?> listNode) {
+            return YMLLoader.getList(yaml, node.getYmlPath(), listNode.getElementType());
+        }
+        return YMLLoader.get(yaml, node.getYmlPath(), (Class<Object>) node.getDataType());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object validatedValue(ReloadableConfigNode<?> node, Object value) {
+        Object candidate = value instanceof List<?> list ? List.copyOf(list) : value;
+        ((ReloadableConfigNode<Object>) node).validateValue(candidate);
+        return candidate;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void applyValidated(ReloadableConfigNode<?> node, Object value) {
+        ((ReloadableConfigNode<Object>) node).applyValidatedValue(value);
     }
 
     public Class<E> enumType() { return enumType; }
@@ -162,12 +231,13 @@ public final class ReloadableConfigHandler<E extends Enum<E> & ReloadableConfigu
     public <T> T get(@NotNull E key, Class<T> requested) { return key.getValue(requested); }
 
     @SuppressWarnings("unchecked")
-    public <T> void set(@NotNull E key, T value) {
-        this.yaml.set(key.getPath(), value);
-        ((ReloadableConfigNode<Object>) key.node()).setValue(value);
+    public synchronized <T> void set(@NotNull E key, T value) {
+        Object validated = validatedValue(key.node(), value);
+        ((ReloadableConfigNode<Object>) key.node()).setValue(validated);
+        this.yaml.set(key.getPath(), key.node().getValue());
     }
 
-    public void save() throws IOException {
+    public synchronized void save() throws IOException {
         YMLBuilder.savePretty(this.yaml, this.configFile, map.values());
     }
 

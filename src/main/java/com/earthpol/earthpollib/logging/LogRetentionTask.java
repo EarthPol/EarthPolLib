@@ -32,7 +32,7 @@ import java.util.function.Consumer;
  * </ul>
  */
 @SuppressWarnings("unused")
-public class LogRetentionTask {
+public class LogRetentionTask implements AutoCloseable {
 
     private static final int DEFAULT_REPORT_BUFFER = 20;
 
@@ -105,6 +105,11 @@ public class LogRetentionTask {
                 handle = null;
             }
         }
+    }
+
+    @Override
+    public void close() {
+        stop();
     }
 
     public void runOnce() {

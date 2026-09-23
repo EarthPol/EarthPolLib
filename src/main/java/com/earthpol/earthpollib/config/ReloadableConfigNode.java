@@ -4,11 +4,12 @@ import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 // TODO: Eventually move ReloadableConfigNode and its subclasses to confignode package folder.
-// TODO: Add the ability for a config node to only be loaded once and not reloaded again (loadOnce?)
 
 /**
  * Base class for a single configuration value (scalar).
@@ -25,9 +26,13 @@ public class ReloadableConfigNode<T> {
     private final String ymlPath;
     private final List<String> comment;
 
-    private T data;
+    private volatile T data;
     private final T defaultValue;
     private final Class<?> dataType;
+    private final List<Rule<T>> rules = new ArrayList<>();
+    private boolean restartRequired;
+
+    private record Rule<T>(Predicate<? super T> test, String message) {}
 
     ReloadableConfigNode(String ymlPath,
                          @NotNull Class<T> dataType,
@@ -51,6 +56,12 @@ public class ReloadableConfigNode<T> {
     }
 
     public void setValue(T value) {
+        validateValue(value);
+        this.data = value;
+    }
+
+    /** Validates without changing the active value. Custom nodes should extend this method. */
+    public void validateValue(T value) {
         Objects.requireNonNull(value, "node data");
 
         if (!dataType.isInstance(value)) {
@@ -60,6 +71,34 @@ public class ReloadableConfigNode<T> {
             );
         }
 
+        for (Rule<T> rule : rules) {
+            if (!rule.test.test(value)) {
+                throw new IllegalArgumentException("Invalid value for '" + ymlPath + "': " + rule.message);
+            }
+        }
+    }
+
+    /** Configure pure validation predicates during node construction, before sharing the node. */
+    public ReloadableConfigNode<T> validateWith(Predicate<? super T> test, String message) {
+        Objects.requireNonNull(test, "test");
+        Objects.requireNonNull(message, "message");
+        if (!test.test(defaultValue) || !test.test(data)) {
+            throw new IllegalArgumentException("Current/default value for '" + ymlPath + "' violates: " + message);
+        }
+        rules.add(new Rule<>(test, message));
+        return this;
+    }
+
+    /** Loads on startup, but subsequent file reloads retain the current active value. */
+    public ReloadableConfigNode<T> restartRequired() {
+        restartRequired = true;
+        return this;
+    }
+
+    public boolean isRestartRequired() { return restartRequired; }
+
+    // Used only after the handler has staged and validated every candidate value.
+    final void applyValidatedValue(T value) {
         this.data = value;
     }
 

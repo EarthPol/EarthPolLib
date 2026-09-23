@@ -37,9 +37,12 @@ Notes:
 ## Included Modules
 
 - Utilities: `annotation`, `command`, `location`, `math`, `string`, `entity.vehicle`
-- Developer config support: `config`, `translation`, `cooldown`
-- Service support: `logging`, `database`, `database.migration`
+- Developer config support: `config`, `translation`, `messaging`, `cooldown`
+- Service support: `lifecycle`, `scheduling`, `logging`, `database`, `database.migration`
 - Gameplay support: `teleport`
+
+See [Common services](docs/common-services.md) for task ownership and cleanup, component messages,
+command checks and confirmations, asynchronous database readiness, and validated configuration reloads.
 
 ## Database Defaults
 

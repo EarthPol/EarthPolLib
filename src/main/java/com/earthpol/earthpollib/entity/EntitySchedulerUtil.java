@@ -4,6 +4,7 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.entity.Entity;
 import org.bukkit.plugin.Plugin;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.function.Consumer;
 
@@ -41,7 +42,7 @@ public final class EntitySchedulerUtil {
         entity.getScheduler().runDelayed(plugin, scheduledTask -> task.run(), retiredTask, delayTicks);
     }
 
-    public static @NotNull ScheduledTask runAtFixedRate(
+    public static @Nullable ScheduledTask runAtFixedRate(
         @NotNull Plugin plugin,
         @NotNull Entity entity,
         long initialDelayTicks,
@@ -51,7 +52,7 @@ public final class EntitySchedulerUtil {
         return runAtFixedRate(plugin, entity, initialDelayTicks, periodTicks, task, null);
     }
 
-    public static @NotNull ScheduledTask runAtFixedRate(
+    public static @Nullable ScheduledTask runAtFixedRate(
         @NotNull Plugin plugin,
         @NotNull Entity entity,
         long initialDelayTicks,
