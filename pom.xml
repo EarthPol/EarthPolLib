@@ -13,10 +13,15 @@
 
     <distributionManagement>
         <repository>
-            <id>github</id>
-            <name>GitHub Packages</name>
-            <url>https://maven.pkg.github.com/earthpolforever/EarthPolLib</url>
+            <id>nexus-releases</id>
+            <name>Bitworks Nexus Releases</name>
+            <url>https://nexus.tinydc.net/repository/maven-releases/</url>
         </repository>
+        <snapshotRepository>
+            <id>nexus-snapshots</id>
+            <name>Bitworks Nexus Snapshots</name>
+            <url>https://nexus.tinydc.net/repository/maven-snapshots/</url>
+        </snapshotRepository>
     </distributionManagement>
 
     <properties>
@@ -33,8 +38,7 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
                 <configuration>
-                    <source>${java.version}</source>
-                    <target>${java.version}</target>
+                    <release>${java.version}</release>
                 </configuration>
             </plugin>
             <plugin>
